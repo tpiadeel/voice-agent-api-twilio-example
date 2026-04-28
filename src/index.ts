@@ -65,7 +65,7 @@ function buildSessionUpdate(opts: {
       input: { type: "audio", format: { encoding: "audio/pcmu" } },
       output: {
         type: "audio",
-        voice: opts.voice ?? "josh",
+        voice: opts.voice ?? "ivy",
         format: { encoding: "audio/pcmu" },
       },
       ...(opts.withTools ? { tools: TOOLS } : {}),
