@@ -54,7 +54,7 @@ Open `.env` and fill in:
 
 ```bash
 ASSEMBLYAI_API_KEY=your-assemblyai-api-key
-HOSTNAME=https://your-ngrok-domain.ngrok.app
+PUBLIC_HOSTNAME=https://your-ngrok-domain.ngrok.app
 ```
 
 ### 4. Run the server
@@ -123,7 +123,7 @@ If you adapt this example to a non-telephony transport (e.g. browser via WebRTC)
 
 ## Troubleshooting
 
-- **Twilio call connects but you hear nothing.** Check `HOSTNAME` matches your ngrok domain and that your server is reachable. Watch ngrok's request log for the incoming Media Streams WebSocket.
+- **Twilio call connects but you hear nothing.** Check `PUBLIC_HOSTNAME` matches your ngrok domain and that your server is reachable. Watch ngrok's request log for the incoming Media Streams WebSocket.
 - **`session.error` with code `invalid_value` on the `voice` field.** Voice names are case-sensitive — use lowercase (`ivy`, `claire`, `dawn`, etc.).
 - **Greeting plays but later replies don't.** Make sure your tool handler always sends a `tool.result` back. The model waits for it before continuing.
 - **Audio is choppy or echoey.** Twilio echo cancellation runs on the carrier side, so software AEC isn't needed on this server. If you're hearing echo locally during testing, it's likely your speakerphone — use a headset.

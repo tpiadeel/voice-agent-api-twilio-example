@@ -82,13 +82,13 @@ app.get("/health", (_req, res) => {
 });
 
 app.post("/twiml", (req, res) => {
-  if (!process.env.HOSTNAME) {
-    res.status(500).send("HOSTNAME env var not set");
+  if (!process.env.PUBLIC_HOSTNAME) {
+    res.status(500).send("PUBLIC_HOSTNAME env var not set");
     return;
   }
 
   const callId = newCallId();
-  const hostname = process.env.HOSTNAME.replace(/^https?:\/\//, "");
+  const hostname = process.env.PUBLIC_HOSTNAME.replace(/^https?:\/\//, "");
   const streamUrl = `wss://${hostname}/media-stream/${callId}`;
 
   res.type("text/xml").status(200).send(
@@ -304,7 +304,7 @@ const OUTBOUND_GREETING =
   "Hi! This is the AssemblyAI Voice Agent API calling. Got a moment to chat?";
 
 app.post("/outbound-twiml", (_req, res) => {
-  const hostname = (process.env.HOSTNAME || "").replace(/^https?:\/\//, "");
+  const hostname = (process.env.PUBLIC_HOSTNAME || "").replace(/^https?:\/\//, "");
   res.type("text/xml").send(
     `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -418,8 +418,34 @@ app.ws("/outbound-stream", (ws) => {
 // ----------------------------------------------------------------------------
 
 const port = process.env.PORT || 3000;
+
+// Mask secrets so they're visible enough to verify without leaking the full value.
+const mask = (value?: string) => {
+  if (!value) return "(not set)";
+  if (value.length <= 8) return "********";
+  return `${value.slice(0, 4)}…${value.slice(-4)} (${value.length} chars)`;
+};
+
+function printConfig() {
+  const rows: [string, string][] = [
+    ["ASSEMBLYAI_API_KEY", mask(process.env.ASSEMBLYAI_API_KEY)],
+    ["AAI_AGENT_URL", AAI_AGENT_URL],
+    ["ENABLE_TOOLS", ENABLE_TOOLS ? "enabled" : "disabled"],
+    ["PUBLIC_HOSTNAME", process.env.PUBLIC_HOSTNAME || "(not set)"],
+    ["PORT", String(port)],
+    ["TWILIO_ACCOUNT_SID", process.env.TWILIO_ACCOUNT_SID || "(not set)"],
+    ["TWILIO_AUTH_TOKEN", mask(process.env.TWILIO_AUTH_TOKEN)],
+    ["TWILIO_PHONE_NUMBER", process.env.TWILIO_PHONE_NUMBER || "(not set)"],
+    ["TARGET_PHONE_NUMBER", process.env.TARGET_PHONE_NUMBER || "(not set)"],
+  ];
+  const width = Math.max(...rows.map(([k]) => k.length));
+  console.log("Configuration:");
+  for (const [key, value] of rows) {
+    console.log(`  ${key.padEnd(width)}  ${value}`);
+  }
+}
+
 app.listen(port, () => {
   console.log(`Server running on http://localhost:${port}`);
-  console.log(`Voice Agent API: ${AAI_AGENT_URL}`);
-  console.log(`Tool calling: ${ENABLE_TOOLS ? "enabled" : "disabled"}`);
+  printConfig();
 });

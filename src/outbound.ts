@@ -11,7 +11,7 @@
  *   TWILIO_AUTH_TOKEN
  *   TWILIO_PHONE_NUMBER  — your Twilio number (E.164, e.g. +14155550100)
  *   TARGET_PHONE_NUMBER  — the number to call
- *   HOSTNAME             — public URL of this server (https://abc.ngrok.app)
+ *   PUBLIC_HOSTNAME      — public URL of this server (https://abc.ngrok.app)
  *
  * The main server (npm run dev) must be running.
  */
@@ -24,7 +24,7 @@ const {
   TWILIO_AUTH_TOKEN = "",
   TWILIO_PHONE_NUMBER = "",
   TARGET_PHONE_NUMBER = "",
-  HOSTNAME = "",
+  PUBLIC_HOSTNAME = "",
 } = process.env;
 
 for (const [name, value] of [
@@ -32,7 +32,7 @@ for (const [name, value] of [
   ["TWILIO_AUTH_TOKEN", TWILIO_AUTH_TOKEN],
   ["TWILIO_PHONE_NUMBER", TWILIO_PHONE_NUMBER],
   ["TARGET_PHONE_NUMBER", TARGET_PHONE_NUMBER],
-  ["HOSTNAME", HOSTNAME],
+  ["PUBLIC_HOSTNAME", PUBLIC_HOSTNAME],
 ] as const) {
   if (!value) {
     console.error(`Missing env var: ${name}`);
@@ -43,7 +43,7 @@ for (const [name, value] of [
 const twilio = Twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
 (async () => {
-  const url = `${HOSTNAME.replace(/\/$/, "")}/outbound-twiml`;
+  const url = `${PUBLIC_HOSTNAME.replace(/\/$/, "")}/outbound-twiml`;
   console.log(`Calling ${TARGET_PHONE_NUMBER} from ${TWILIO_PHONE_NUMBER}`);
   console.log(`TwiML URL: ${url}`);
 
