@@ -65,7 +65,7 @@ function buildSessionUpdate(opts: {
       input: { type: "audio", format: { encoding: "audio/pcmu" } },
       output: {
         type: "audio",
-        voice: opts.voice ?? "ivy",
+        voice: opts.voice ?? "winter",
         format: { encoding: "audio/pcmu" },
       },
       ...(opts.withTools ? { tools: TOOLS } : {}),
@@ -115,10 +115,27 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   console.log(`\n[${callId}] === CALL STARTED ===`);
 
   const tw = new TwilioMediaStreamWebsocket(ws);
+  let twilioCallSid = "";
 
   tw.on("start", (msg) => {
     tw.streamSid = msg.start.streamSid;
-    log(callId, "twilio.start");
+    twilioCallSid = msg.start.callSid;
+    log(callId, "twilio.start", `callSid=${twilioCallSid}`);
+  });
+
+  // Hang up the call. Closing the Twilio media-stream WebSocket ends the
+  // <Connect> verb; with no further TwiML the PSTN call terminates.
+  const hangup = () => {
+    log(callId, "hangup");
+    if (aaiWs.readyState === WebSocket.OPEN) aaiWs.close();
+    if (ws.readyState === ws.OPEN) ws.close();
+  };
+
+  // The agent's goodbye audio is buffered inside Twilio. We send a mark after
+  // it and only hang up once Twilio echoes the mark back — i.e. playback is
+  // done — so the goodbye isn't cut off.
+  tw.on("mark", (msg) => {
+    if (msg.mark.name === "hangup") hangup();
   });
 
   // Connect to Voice Agent API
@@ -213,9 +230,18 @@ app.ws("/media-stream/:callId", async (ws, req) => {
         break;
 
       case "tool.call":
-        handleToolCall(callId, event, aaiWs).catch((e) =>
-          console.error(`[${callId}] tool error`, e),
-        );
+        handleToolCall(callId, event, aaiWs)
+          .then(() => {
+            if (event.name !== "end_call") return;
+            // Queue a mark behind any goodbye audio; hang up when it echoes
+            // back. If the stream isn't up, hang up immediately.
+            if (tw.streamSid) {
+              tw.send({ event: "mark", streamSid: tw.streamSid, mark: { name: "hangup" } });
+            } else {
+              hangup();
+            }
+          })
+          .catch((e) => console.error(`[${callId}] tool error`, e));
         break;
 
       case "reply.done":
@@ -345,7 +371,7 @@ app.ws("/outbound-stream", (ws) => {
             buildSessionUpdate({
               systemPrompt: OUTBOUND_PROMPT,
               greeting: OUTBOUND_GREETING,
-              voice: "claire",
+              voice: "winter",
               withTools: false,
             }),
           ),
