@@ -53,6 +53,10 @@ const OUTBOUND_GREETING_DELAY_MS = Number(process.env.OUTBOUND_GREETING_DELAY_MS
 // path so leading audio isn't dropped.
 const MULAW_SILENCE_FRAME = Buffer.alloc(160, 0xff).toString("base64");
 
+// Outbound only: a burst of silence queued right BEFORE the greeting audio, so
+// any residual clipping eats this padding instead of the agent's first words.
+const OUTBOUND_GREETING_PAD_MS = Number(process.env.OUTBOUND_GREETING_PAD_MS) || 500;
+
 if (!ASSEMBLYAI_API_KEY) {
   console.error("Missing ASSEMBLYAI_API_KEY");
   process.exit(1);
@@ -91,9 +95,9 @@ function buildSessionUpdate(opts: {
         // end-of-turn are detected quickly on 8 kHz telephony audio.
         turn_detection: {
           interrupt_response: true,
-          vad_threshold: 0.4,
-          min_silence: 480,
-          max_silence: 2000,
+          vad_threshold: 0.3,
+          min_silence: 450,
+          max_silence: 1500,
         },
       },
       output: {
@@ -428,6 +432,20 @@ app.ws("/outbound-stream", (ws) => {
     }
   };
 
+  // Queue a fixed burst of silence frames before the greeting (a playback
+  // cushion). Sent once, right before the agent's first audio.
+  let greetingPadded = false;
+  const sendGreetingPad = () => {
+    if (greetingPadded) return;
+    greetingPadded = true;
+    const frames = Math.round(OUTBOUND_GREETING_PAD_MS / 20);
+    for (let i = 0; i < frames; i++) {
+      if (ws.readyState === ws.OPEN && streamSid) {
+        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: MULAW_SILENCE_FRAME } }));
+      }
+    }
+  };
+
   const hangup = () => {
     log(`OUT ${callId}`, "hangup");
     stopSilence();
@@ -520,6 +538,8 @@ app.ws("/outbound-stream", (ws) => {
             break;
           case "reply.audio":
             if (event.data) {
+              stopSilence(); // real audio is starting — stop priming
+              sendGreetingPad(); // one-time silence cushion before first words
               ws.send(
                 JSON.stringify({
                   event: "media",
@@ -579,12 +599,14 @@ app.ws("/outbound-stream", (ws) => {
       if (msg.mark?.name === "hangup") hangup();
     } else if (msg.event === "stop") {
       log(`OUT ${callId}`, "twilio.stop");
+      stopSilence();
       aaiWs?.close();
     }
   });
 
   ws.on("close", () => {
     log(`OUT ${callId}`, "twilio.close");
+    stopSilence();
     aaiWs?.close();
   });
 });
