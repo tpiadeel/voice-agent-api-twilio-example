@@ -19,7 +19,17 @@ import express from "express";
 import ExpressWs from "express-ws";
 import * as crypto from "crypto";
 import WebSocket from "ws";
-import { SYSTEM_PROMPT, DEFAULT_GREETING, TOOLS, runTool } from "./bot";
+import {
+  SYSTEM_PROMPT,
+  DEFAULT_GREETING,
+  OUTBOUND_PROMPT,
+  OUTBOUND_GREETING,
+  INBOUND_VOICE,
+  OUTBOUND_VOICE,
+  TOOLS,
+  OUTBOUND_TOOLS,
+  runTool,
+} from "./bot";
 import { TwilioMediaStreamWebsocket } from "./twilio";
 
 const { app } = ExpressWs(express());
@@ -32,6 +42,16 @@ app.use(express.urlencoded({ extended: true })).use(express.json());
 const ASSEMBLYAI_API_KEY = process.env.ASSEMBLYAI_API_KEY || "";
 const AAI_AGENT_URL = process.env.AAI_AGENT_URL || "wss://agents.assemblyai.com/v1/realtime";
 const ENABLE_TOOLS = process.env.ENABLE_TOOLS !== "false";
+// Outbound only: wait this long after the call connects before the agent
+// greets. During this window we stream silence (below) so the callee's audio
+// path opens BEFORE the greeting plays — otherwise the opening words are
+// clipped. Override with OUTBOUND_GREETING_DELAY_MS.
+const OUTBOUND_GREETING_DELAY_MS = Number(process.env.OUTBOUND_GREETING_DELAY_MS) || 2000;
+
+// One 20ms frame of G.711 μ-law silence (0xFF), base64-encoded. 8 kHz * 0.02s
+// = 160 samples = 160 bytes. Streamed to Twilio to prime/keep-alive the audio
+// path so leading audio isn't dropped.
+const MULAW_SILENCE_FRAME = Buffer.alloc(160, 0xff).toString("base64");
 
 if (!ASSEMBLYAI_API_KEY) {
   console.error("Missing ASSEMBLYAI_API_KEY");
@@ -53,7 +73,7 @@ function buildSessionUpdate(opts: {
   systemPrompt: string;
   greeting: string;
   voice?: string;
-  withTools?: boolean;
+  tools?: readonly unknown[];
 }) {
   return {
     type: "session.update",
@@ -62,13 +82,26 @@ function buildSessionUpdate(opts: {
       greeting: opts.greeting,
       // Twilio sends G.711 μ-law at 8 kHz — match it on input and output
       // so the Voice Agent API doesn't need to transcode.
-      input: { type: "audio", format: { encoding: "audio/pcmu" } },
+      input: {
+        type: "audio",
+        format: { encoding: "audio/pcmu" },
+        // Turn detection / barge-in. interrupt_response lets the caller cut
+        // the agent off mid-sentence. We lower vad_threshold (more sensitive
+        // to speech) and shorten the silence windows so interruptions and
+        // end-of-turn are detected quickly on 8 kHz telephony audio.
+        turn_detection: {
+          interrupt_response: true,
+          vad_threshold: 0.4,
+          min_silence: 480,
+          max_silence: 2000,
+        },
+      },
       output: {
         type: "audio",
-        voice: opts.voice ?? "winter",
+        voice: opts.voice ?? INBOUND_VOICE,
         format: { encoding: "audio/pcmu" },
       },
-      ...(opts.withTools ? { tools: TOOLS } : {}),
+      ...(opts.tools && opts.tools.length ? { tools: opts.tools } : {}),
     },
   };
 }
@@ -165,7 +198,8 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   const sessionUpdate = buildSessionUpdate({
     systemPrompt: SYSTEM_PROMPT,
     greeting: DEFAULT_GREETING,
-    withTools: ENABLE_TOOLS,
+    voice: INBOUND_VOICE,
+    tools: ENABLE_TOOLS ? TOOLS : [],
   });
   aaiWs.send(JSON.stringify(sessionUpdate));
   log(callId, "aai.session.update sent");
@@ -173,6 +207,33 @@ app.ws("/media-stream/:callId", async (ws, req) => {
   let sessionReady = false;
   let turnCount = 0;
   let turnActive = false;
+
+  // Tool results are buffered and only sent when `reply.done` is the latest
+  // event (the safe window per the tool-calling guidelines). `toolWindowOpen`
+  // tracks that window so a tool that resolves *after* reply.done still flushes.
+  let pendingToolResults: PendingToolResult[] = [];
+  let toolWindowOpen = false;
+
+  const sendToolResult = (p: PendingToolResult) => {
+    aaiWs.send(
+      JSON.stringify({ type: "tool.result", call_id: p.call_id, result: p.result, is_error: false }),
+    );
+    // end_call: once the result is acknowledged, queue a mark behind any
+    // goodbye audio and hang up when Twilio echoes it back.
+    if (p.name === "end_call") {
+      if (tw.streamSid) {
+        tw.send({ event: "mark", streamSid: tw.streamSid, mark: { name: "hangup" } });
+      } else {
+        hangup();
+      }
+    }
+  };
+
+  const flushToolResults = () => {
+    const items = pendingToolResults;
+    pendingToolResults = [];
+    for (const p of items) sendToolResult(p);
+  };
 
   // ---- Voice Agent API → Twilio ----
   aaiWs.on("message", (data) => {
@@ -199,6 +260,7 @@ app.ws("/media-stream/:callId", async (ws, req) => {
         if (turnActive) log(callId, `=== TURN ${turnCount} INTERRUPTED ===`);
         turnCount++;
         turnActive = true;
+        toolWindowOpen = false; // a turn is in progress — not safe to send tool results
         log(callId, `=== START TURN ${turnCount} ===`);
         break;
 
@@ -214,11 +276,9 @@ app.ws("/media-stream/:callId", async (ws, req) => {
         break;
 
       case "input.speech.started":
-        // User barged in — drop any audio Twilio has buffered so the bot
-        // stops talking immediately.
-        if (tw.streamSid) {
-          tw.send({ event: "clear", streamSid: tw.streamSid });
-        }
+        // Raw voice activity — fires for back-channels ("uh-huh") too, so we
+        // do NOT flush here. The agent only stops when the API semantically
+        // confirms a real interruption (reply.done with status "interrupted").
         break;
 
       case "transcript.user":
@@ -230,22 +290,30 @@ app.ws("/media-stream/:callId", async (ws, req) => {
         break;
 
       case "tool.call":
-        handleToolCall(callId, event, aaiWs)
-          .then(() => {
-            if (event.name !== "end_call") return;
-            // Queue a mark behind any goodbye audio; hang up when it echoes
-            // back. If the stream isn't up, hang up immediately.
-            if (tw.streamSid) {
-              tw.send({ event: "mark", streamSid: tw.streamSid, mark: { name: "hangup" } });
-            } else {
-              hangup();
-            }
+        handleToolCall(callId, event)
+          .then((pending) => {
+            pendingToolResults.push(pending);
+            // If the tool finished after reply.done already arrived, we're in
+            // the safe window — flush now. Otherwise reply.done will flush.
+            if (toolWindowOpen) flushToolResults();
           })
           .catch((e) => console.error(`[${callId}] tool error`, e));
         break;
 
       case "reply.done":
         turnActive = false;
+        if (event.status === "interrupted") {
+          // Barge-in: flush Twilio's buffered audio so the agent goes quiet,
+          // and discard any pending tool results — a fresh turn has begun.
+          if (tw.streamSid) tw.send({ event: "clear", streamSid: tw.streamSid });
+          pendingToolResults = [];
+          toolWindowOpen = false;
+        } else {
+          // Safe window: reply.done is now the latest event, so deliver any
+          // tool results we buffered during the transition phrase.
+          toolWindowOpen = true;
+          flushToolResults();
+        }
         log(callId, `=== END TURN ${turnCount} (status=${event.status ?? "completed"}) ===`);
         break;
 
@@ -282,27 +350,28 @@ app.ws("/media-stream/:callId", async (ws, req) => {
 // Tool dispatch
 // ----------------------------------------------------------------------------
 
-async function handleToolCall(callId: string, event: any, aaiWs: WebSocket) {
+export type PendingToolResult = { call_id: string; name: string; result: string };
+
+// Run the requested tool and return the result to be sent back. We do NOT send
+// it here: per the Voice Agent API tool-calling guidelines, `tool.result` must
+// be delivered only once `reply.done` is the latest event (the agent has
+// finished its transition phrase). The caller buffers this and flushes it then.
+async function handleToolCall(callId: string, event: any): Promise<PendingToolResult> {
   const name: string = event.name ?? "";
+  // The API sends parameters as `arguments`; accept `args` too for safety.
+  const rawArgs = event.arguments ?? event.args;
   const args: Record<string, any> =
-    typeof event.args === "string"
-      ? safeParse(event.args)
-      : event.args && typeof event.args === "object"
-      ? event.args
+    typeof rawArgs === "string"
+      ? safeParse(rawArgs)
+      : rawArgs && typeof rawArgs === "object"
+      ? rawArgs
       : {};
 
   console.log(`[${callId}] tool.call ${name}(${JSON.stringify(args)})`);
   const result = await runTool(name, args);
   console.log(`[${callId}] tool.result ${result}`);
 
-  aaiWs.send(
-    JSON.stringify({
-      type: "tool.result",
-      call_id: event.call_id,
-      result, // already a JSON string
-      is_error: false,
-    }),
-  );
+  return { call_id: event.call_id, name, result };
 }
 
 function safeParse(s: string): Record<string, any> {
@@ -314,20 +383,9 @@ function safeParse(s: string): Record<string, any> {
 }
 
 // ----------------------------------------------------------------------------
-// Outbound: agent speaks first
+// Outbound: agent speaks first. The persona lives in bot.ts
+// (OUTBOUND_PROMPT / OUTBOUND_GREETING).
 // ----------------------------------------------------------------------------
-
-const OUTBOUND_PROMPT = `You are an outbound voice agent powered by the AssemblyAI Voice Agent API. You're calling the user to introduce them to this technology and answer any questions.
-
-You are making an OUTBOUND call, so YOU speak first. Greet the caller warmly and tell them:
-- You're calling from AssemblyAI to share information about the Voice Agent API.
-- It's a single WebSocket endpoint for real-time voice agents — speech in, speech out.
-- It supports telephony via Twilio, browser apps, and direct WebSocket connections.
-
-Be friendly and concise. Answer questions naturally. If they're not interested, thank them and end the call gracefully.`;
-
-const OUTBOUND_GREETING =
-  "Hi! This is the AssemblyAI Voice Agent API calling. Got a moment to chat?";
 
 app.post("/outbound-twiml", (_req, res) => {
   const hostname = (process.env.PUBLIC_HOSTNAME || "").replace(/^https?:\/\//, "");
@@ -348,6 +406,57 @@ app.ws("/outbound-stream", (ws) => {
   let sessionReady = false;
   console.log(`\n[OUTBOUND ${callId}] === CALL STARTED ===`);
 
+  // Tool-result buffering + hangup (same approach as the inbound flow).
+  let pendingToolResults: PendingToolResult[] = [];
+  let toolWindowOpen = false;
+
+  // Stream silence to Twilio until the agent's real audio starts, so the
+  // callee's audio path is open before the greeting plays (no clipped words).
+  let silenceTimer: ReturnType<typeof setInterval> | null = null;
+  const startSilence = () => {
+    if (silenceTimer) return;
+    silenceTimer = setInterval(() => {
+      if (ws.readyState === ws.OPEN && streamSid) {
+        ws.send(JSON.stringify({ event: "media", streamSid, media: { payload: MULAW_SILENCE_FRAME } }));
+      }
+    }, 20);
+  };
+  const stopSilence = () => {
+    if (silenceTimer) {
+      clearInterval(silenceTimer);
+      silenceTimer = null;
+    }
+  };
+
+  const hangup = () => {
+    log(`OUT ${callId}`, "hangup");
+    stopSilence();
+    if (aaiWs && aaiWs.readyState === WebSocket.OPEN) aaiWs.close();
+    if (ws.readyState === ws.OPEN) ws.close();
+  };
+
+  const sendToolResult = (p: PendingToolResult) => {
+    if (aaiWs && aaiWs.readyState === WebSocket.OPEN) {
+      aaiWs.send(
+        JSON.stringify({ type: "tool.result", call_id: p.call_id, result: p.result, is_error: false }),
+      );
+    }
+    // end_call: drain any goodbye audio (mark echoes back), then hang up.
+    if (p.name === "end_call") {
+      if (streamSid) {
+        ws.send(JSON.stringify({ event: "mark", streamSid, mark: { name: "hangup" } }));
+      } else {
+        hangup();
+      }
+    }
+  };
+
+  const flushToolResults = () => {
+    const items = pendingToolResults;
+    pendingToolResults = [];
+    for (const p of items) sendToolResult(p);
+  };
+
   ws.on("message", (data) => {
     let msg: any;
     try {
@@ -360,22 +469,33 @@ app.ws("/outbound-stream", (ws) => {
       streamSid = msg.start.streamSid;
       log(`OUT ${callId}`, "twilio.start");
 
+      // Start priming the audio path with silence immediately, before the
+      // greeting. Stopped once the agent's first real audio arrives.
+      startSilence();
+
       aaiWs = new WebSocket(AAI_AGENT_URL, {
         headers: { Authorization: `Bearer ${ASSEMBLYAI_API_KEY}` },
       });
 
       aaiWs.on("open", () => {
         log(`OUT ${callId}`, "aai.open");
-        aaiWs!.send(
-          JSON.stringify(
-            buildSessionUpdate({
-              systemPrompt: OUTBOUND_PROMPT,
-              greeting: OUTBOUND_GREETING,
-              voice: "winter",
-              withTools: false,
-            }),
-          ),
-        );
+        // Hold the session.update briefly. It triggers session.ready and the
+        // auto-greeting, so delaying it lets the callee's audio path settle —
+        // otherwise the opening words get clipped on outbound calls.
+        setTimeout(() => {
+          if (!aaiWs || aaiWs.readyState !== WebSocket.OPEN) return;
+          aaiWs.send(
+            JSON.stringify(
+              buildSessionUpdate({
+                systemPrompt: OUTBOUND_PROMPT,
+                greeting: OUTBOUND_GREETING,
+                voice: OUTBOUND_VOICE,
+                tools: ENABLE_TOOLS ? OUTBOUND_TOOLS : [],
+              }),
+            ),
+          );
+          log(`OUT ${callId}`, `aai.session.update sent (after ${OUTBOUND_GREETING_DELAY_MS}ms)`);
+        }, OUTBOUND_GREETING_DELAY_MS);
       });
 
       aaiWs.on("message", (chunk) => {
@@ -395,6 +515,9 @@ app.ws("/outbound-stream", (ws) => {
             // start speaking as soon as session.ready fires — no `reply.create`
             // needed.
             break;
+          case "reply.started":
+            toolWindowOpen = false; // a turn is active — not safe to send tool results
+            break;
           case "reply.audio":
             if (event.data) {
               ws.send(
@@ -407,7 +530,30 @@ app.ws("/outbound-stream", (ws) => {
             }
             break;
           case "input.speech.started":
-            ws.send(JSON.stringify({ event: "clear", streamSid }));
+            // Raw VAD (fires on back-channels too) — don't flush here; wait
+            // for the semantic interruption signal on reply.done below.
+            break;
+          case "tool.call":
+            handleToolCall(`OUT ${callId}`, event)
+              .then((pending) => {
+                pendingToolResults.push(pending);
+                if (toolWindowOpen) flushToolResults();
+              })
+              .catch((e) => console.error(`[OUT ${callId}] tool error`, e));
+            break;
+          case "reply.done":
+            if (event.status === "interrupted") {
+              // Semantic barge-in: flush Twilio's buffered audio and drop any
+              // pending tool results — a fresh turn has begun.
+              ws.send(JSON.stringify({ event: "clear", streamSid }));
+              pendingToolResults = [];
+              toolWindowOpen = false;
+            } else {
+              // Safe window: deliver buffered tool results now.
+              toolWindowOpen = true;
+              flushToolResults();
+            }
+            log(`OUT ${callId}`, `reply.done status=${event.status ?? "completed"}`);
             break;
           case "transcript.agent":
             if (event.text) console.log(`[OUT ${callId}] Agent: "${event.text}"`);
@@ -427,6 +573,10 @@ app.ws("/outbound-stream", (ws) => {
       if (aaiWs && sessionReady && aaiWs.readyState === WebSocket.OPEN) {
         aaiWs.send(JSON.stringify({ type: "input.audio", audio: msg.media.payload }));
       }
+    } else if (msg.event === "mark") {
+      // Twilio finished playing audio up to this mark. If it's our hangup
+      // mark, the goodbye has played — end the call now.
+      if (msg.mark?.name === "hangup") hangup();
     } else if (msg.event === "stop") {
       log(`OUT ${callId}`, "twilio.stop");
       aaiWs?.close();
@@ -459,6 +609,8 @@ function printConfig() {
     ["ENABLE_TOOLS", ENABLE_TOOLS ? "enabled" : "disabled"],
     ["PUBLIC_HOSTNAME", process.env.PUBLIC_HOSTNAME || "(not set)"],
     ["PORT", String(port)],
+    ["INBOUND_VOICE", INBOUND_VOICE],
+    ["OUTBOUND_VOICE", OUTBOUND_VOICE],
     ["TWILIO_ACCOUNT_SID", process.env.TWILIO_ACCOUNT_SID || "(not set)"],
     ["TWILIO_AUTH_TOKEN", mask(process.env.TWILIO_AUTH_TOKEN)],
     ["TWILIO_PHONE_NUMBER", process.env.TWILIO_PHONE_NUMBER || "(not set)"],
